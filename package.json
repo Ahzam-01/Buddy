@@ -1,9 +1,9 @@
 {
-  "name": "buddy-starter",
-  "productName": "buddy-starter",
+  "name": "buddy",
+  "productName": "Buddy",
   "version": "1.0.0",
   "private": true,
-  "description": "My Electron application description",
+  "description": "Local-first Odoo connection and tunnel control center.",
   "keywords": [],
   "license": "MIT",
   "author": {
