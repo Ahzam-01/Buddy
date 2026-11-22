@@ -214,6 +214,7 @@ function migrateInstance(raw: unknown): OdooInstance | null {
   const sshRaw = isRecord(legacy.ssh) ? legacy.ssh : {};
   return {
     id: legacy.id as string, name: cleanText(legacy.name, 80)!, description: typeof legacy.description === 'string' ? legacy.description.slice(0, 500) : '', notes: typeof legacy.notes === 'string' ? legacy.notes.slice(0, 2000) : '', enabled: legacy.enabled !== false,
+    approvalsEnabled: legacy.approvalsEnabled !== false,
     deploymentNature, environment, odooVersion: Number.isInteger(legacy.odooVersion) && Number(legacy.odooVersion) > 0 ? Number(legacy.odooVersion) : 18,
     edition: legacy.edition === 'ee' ? 'ee' : 'ce',
     docker: { odooContainer: isRecord(legacy.docker) && typeof legacy.docker.odooContainer === 'string' ? legacy.docker.odooContainer.slice(0, 120) : '', postgresContainer: isRecord(legacy.docker) && typeof legacy.docker.postgresContainer === 'string' ? legacy.docker.postgresContainer.slice(0, 120) : '' },
@@ -923,6 +924,12 @@ function requestConfirmation(operation: string, input: Record<string, unknown>, 
   return fail('confirmation_required', `Approval is required in Buddy before this operation can run. Confirmation ID: ${id}`);
 }
 function approvedConfirmation(operation: string, input: Record<string, unknown>, instance: OdooInstance, container: string, summary: string): OperationResult<undefined> {
+  // Approval bypass is instance-scoped and can never apply to production.
+  // All permission checks and operation safety validations still run before
+  // this helper is reached.
+  if (instance.approvalsEnabled === false && instance.environment !== 'production') {
+    return ok(undefined);
+  }
   const requested = requestConfirmation(operation, input, instance, container, summary);
   return requested.ok ? ok(undefined) : requested;
 }
@@ -1454,6 +1461,7 @@ app.whenReady().then(() => {
         id: instanceId,
         name, description: typeof input.description === 'string' ? input.description.slice(0, 500) : '',
         notes: typeof input.notes === 'string' ? input.notes.slice(0, 2000) : '', enabled: input.enabled !== false,
+        approvalsEnabled: environment === 'production' ? true : input.approvalsEnabled !== false,
         deploymentNature: deploymentNature as DeploymentNature,
         environment: environment as EnvironmentType,
         odooVersion: Number(input.odooVersion), edition: input.edition as 'ce' | 'ee',

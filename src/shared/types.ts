@@ -72,6 +72,8 @@ export type OdooInstance = {
   description: string;
   notes: string;
   enabled: boolean;
+  /** When false, operation-level approval prompts are bypassed for non-production instances. */
+  approvalsEnabled: boolean;
   deploymentNature: DeploymentNature;
   environment: EnvironmentType;
   odooVersion: number;
