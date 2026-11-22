@@ -229,7 +229,7 @@ function loadStore(): StoredSettings {
   if (!existsSync(file)) return defaults();
   try {
     const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
-    if (!isRecord(parsed) || (parsed.schemaVersion !== 1 && parsed.schemaVersion !== SETTINGS_VERSION))
+    if (!isRecord(parsed) || ![1, 2, SETTINGS_VERSION].includes(parsed.schemaVersion as number))
       throw new Error('unsupported settings format');
     const base = defaults();
     return {
@@ -737,11 +737,23 @@ async function executeRemoteFilesystem(instance: OdooInstance, operation: string
   if (operation === 'container_read_file') return ok({ path: requested, content: redacted(run.data.stdout), bytes: Buffer.byteLength(run.data.stdout, 'utf8') });
   return ok(action === 'write' ? { action, path: requested, bytes: Buffer.byteLength(content, 'utf8'), written: true } : action === 'rename' ? { action, path: requested, destinationPath: destination, renamed: true } : action === 'delete' ? { action, path: requested, deleted: true } : { action, path: requested, created: true });
 }
+function documentsWorkspaceRoot(): OperationResult<string> {
+  try {
+    const documents = realpathSync(path.join(app.getPath('home'), 'Documents'));
+    if (!statSync(documents).isDirectory()) return fail('workspace_documents_unavailable', 'The local Documents directory is unavailable.');
+    return ok(documents);
+  } catch { return fail('workspace_documents_unavailable', 'Create or restore your local Documents directory before configuring a Development Workspace.'); }
+}
+function isWithinLocalDocuments(root: string): boolean {
+  const documents = documentsWorkspaceRoot();
+  return documents.ok && root !== documents.data && root.startsWith(`${documents.data}${path.sep}`);
+}
 function workspaceRoot(instance: OdooInstance): OperationResult<string> {
   const configured = instance.developmentWorkspace.repositoryPath;
-  if (!configured) return fail('workspace_unconfigured', 'Custom source changes require a configured local Development Workspace for this instance.');
+  if (!configured) return fail('workspace_unconfigured', 'Custom source changes require a configured local Git repository inside Documents for this instance.');
   try {
     const root = realpathSync(configured);
+    if (!isWithinLocalDocuments(root)) return fail('workspace_outside_documents', 'The configured Development Workspace must remain inside your local Documents directory.');
     if (!statSync(root).isDirectory() || !existsSync(path.join(root, '.git'))) return fail('workspace_invalid', 'The Development Workspace must be an accessible local Git repository.');
     return ok(root);
   } catch { return fail('workspace_unavailable', 'The configured Development Workspace is unavailable. Update the instance configuration.'); }
@@ -749,41 +761,99 @@ function workspaceRoot(instance: OdooInstance): OperationResult<string> {
 function canonicalWorkspaceConfiguration(value: unknown): OperationResult<string> {
   if (typeof value !== 'string' || !value.trim()) return ok('');
   const entered = value.trim(); const expanded = entered === '~' ? app.getPath('home') : entered.startsWith('~/') ? path.join(app.getPath('home'), entered.slice(2)) : entered;
-  try { const root = realpathSync(expanded); if (!statSync(root).isDirectory() || !existsSync(path.join(root, '.git'))) return fail('workspace_invalid', 'Development Workspace must be an accessible local Git repository.'); return ok(root); } catch { return fail('workspace_invalid', 'Development Workspace must be an accessible local Git repository.'); }
+  try {
+    const root = realpathSync(expanded);
+    if (!isWithinLocalDocuments(root)) return fail('workspace_outside_documents', 'Choose a Git repository located inside ~/Documents.');
+    if (!statSync(root).isDirectory() || !existsSync(path.join(root, '.git'))) return fail('workspace_invalid', 'Development Workspace must be an accessible local Git repository.');
+    return ok(root);
+  } catch { return fail('workspace_invalid', 'Development Workspace must be an accessible local Git repository inside ~/Documents.'); }
 }
 function workspacePath(root: string, value: unknown, allowRoot = false): OperationResult<{ path: string; relative: string }> {
   if (typeof value !== 'string' || !value || value.length > 500 || /[\0]/.test(value) || path.isAbsolute(value)) return fail('invalid_workspace_path', 'Workspace paths must be non-empty relative paths.');
   const relative = path.normalize(value);
+  if (relative === '.' && allowRoot) return ok({ path: root, relative: '.' });
   if (relative === '.' || relative === '..' || relative.startsWith(`..${path.sep}`)) return fail('workspace_path_escape', 'Workspace paths cannot escape the configured repository.');
+  if (relative.split(path.sep).some((part) => part.toLowerCase() === '.git')) return fail('workspace_git_metadata_denied', 'Buddy cannot read or modify Git metadata inside .git.');
   const target = path.resolve(root, relative);
   if ((target !== root && !target.startsWith(`${root}${path.sep}`)) || (!allowRoot && target === root)) return fail('workspace_path_escape', 'Workspace paths cannot escape the configured repository.');
   return ok({ path: target, relative });
 }
 function canonicalWorkspaceExisting(root: string, target: string): OperationResult<string> {
-  try { const resolved = realpathSync(target); return resolved === root || resolved.startsWith(`${root}${path.sep}`) ? ok(resolved) : fail('workspace_path_escape', 'The path resolves outside the configured repository.'); } catch { return fail('workspace_path_unavailable', 'The requested workspace path does not exist.'); }
+  try {
+    const resolved = realpathSync(target);
+    if (!(resolved === root || resolved.startsWith(`${root}${path.sep}`))) return fail('workspace_path_escape', 'The path resolves outside the configured repository.');
+    if (path.relative(root, resolved).split(path.sep).some((part) => part.toLowerCase() === '.git')) return fail('workspace_git_metadata_denied', 'Buddy cannot access Git metadata through symlinks.');
+    return ok(resolved);
+  } catch { return fail('workspace_path_unavailable', 'The requested workspace path does not exist.'); }
 }
 function canonicalWorkspaceParent(root: string, target: string): OperationResult<string> {
   return canonicalWorkspaceExisting(root, path.dirname(target));
 }
+function workspaceSensitivePath(relative: string): boolean {
+  const normalized = relative.replace(/\\/g, '/').toLowerCase();
+  const name = path.posix.basename(normalized);
+  return name === '.env' || name.startsWith('.env.') && !name.endsWith('.example') || name === '.npmrc' || name === '.pypirc' || name === 'credentials' || name === 'id_rsa' || name === 'id_ed25519' || /\.(pem|key|p12|pfx|keystore|kdbx)$/.test(name) || /(^|\/)(secrets?|private_keys?)(\/|$)/.test(normalized);
+}
 function recordWorkspaceChange(instance: OdooInstance, action: 'write' | 'mkdir' | 'rename' | 'delete', relative: string, destinationPath?: string, summary = ''): void {
   const deployment = instance.developmentWorkspace.deployment;
   deployment.state = 'awaiting_deployment'; deployment.verification = ''; deployment.updatedAt = new Date().toISOString();
-  if (summary) deployment.summary = summary.slice(0, 1000);
+  if (summary) deployment.summary = redacted(summary).slice(0, 1000);
   deployment.files.push({ action, path: relative, ...(destinationPath ? { destinationPath } : {}) });
   deployment.files = deployment.files.slice(-100);
   saveStore();
 }
 function sourceLikeRemoteChange(pathValue: unknown, content: unknown): boolean {
-  const value = typeof pathValue === 'string' ? pathValue.toLowerCase() : '';
-  if (/\.(py|xml|js|ts|jsx|tsx|scss|css|csv|po|pot|qweb|html|json)$/.test(value) || /__manifest__\.py$/.test(value) || /\/(models|views|controllers|security|static|report|reports|data)\//.test(value)) return true;
+  const value = typeof pathValue === 'string' ? pathValue.toLowerCase().replace(/\\/g, '/') : '';
+  const sourceExtensions = /\.(py|pyi|xml|js|mjs|cjs|ts|tsx|jsx|vue|scss|sass|less|css|csv|po|pot|qweb|html|sql|sh|bash)$/;
+  const sourceDirectories = /\/(models|views|controllers|security|static|report|reports|data|wizard|tests|demo|i18n|addons|custom_addons|custom-addons|extra_addons|extra-addons)\//;
+  if (sourceExtensions.test(value) || /(^|\/)__manifest__\.py$/.test(value) || /(^|\/)(manifest|makefile|dockerfile|requirements\.txt|pyproject\.toml|setup\.cfg)$/.test(value) || sourceDirectories.test(`${value.replace(/\/$/, '')}/`)) return true;
   return typeof content === 'string' && /^\s*(from\s+\w+|import\s+\w+|class\s+\w+|def\s+\w+|<odoo[ >]|<template[ >]|\/\*\*\s*@odoo-module)/m.test(content);
+}
+function remoteSourceWriteDenied(instance: OdooInstance, pathValue: unknown, content: unknown): boolean {
+  if (sourceLikeRemoteChange(pathValue, content)) return true;
+  if (typeof pathValue !== 'string' || !pathValue.startsWith('/')) return false;
+  const candidate = path.posix.normalize(pathValue);
+  const configuredRoots = instance.filesystem.addonRoots.filter(Boolean);
+  if (!isDockerized(instance.deploymentNature) && instance.filesystem.projectRoot) {
+    const project = path.posix.normalize(instance.filesystem.projectRoot);
+    configuredRoots.push(...['addons', 'custom_addons', 'custom-addons', 'extra_addons', 'extra-addons', 'odoo/addons'].map((part) => path.posix.join(project, part)));
+  }
+  if (isDockerized(instance.deploymentNature)) configuredRoots.push('/mnt/extra-addons', '/opt/odoo', '/opt/odoo/addons', '/opt/odoo/custom_addons', '/opt/odoo/custom-addons');
+  return configuredRoots.some((root) => {
+    const normalized = path.posix.normalize(root);
+    return candidate === normalized || candidate.startsWith(`${normalized}/`);
+  });
+}
+function remoteDeploymentCommandDenied(commandLine: string): boolean {
+  const command = commandLine.toLowerCase();
+  return /\bgit\s+(?:add|commit|tag|branch|push|pull|fetch|clone|checkout|switch|merge|rebase|reset|cherry-pick|apply|stash|clean|worktree)\b/.test(command)
+    || /\b(?:odoo|odoo-bin)\b[^;&|]*(?:\s-u\s|--update(?:=|\s)|--stop-after-init)/.test(command)
+    || /\b(?:systemctl|service)\s+(?:start|stop|restart|reload)\b/.test(command)
+    || /\bsupervisorctl\s+(?:start|stop|restart|reread|update)\b/.test(command)
+    || /\bdocker\s+(?:start|stop|restart|rm|compose\s+(?:up|restart|down))\b/.test(command)
+    || /\bdocker-compose\s+(?:up|restart|down)\b/.test(command)
+    || /\bkubectl\s+(?:apply|delete|rollout|set\s+image)\b/.test(command)
+    || /\bhelm\s+upgrade\b/.test(command)
+    || /\b(?:make|npm|pnpm|yarn)\s+(?:run\s+)?(?:deploy|release|publish)\b/.test(command)
+    || /\b(?:scp|rsync|ansible-playbook|fab)\b/.test(command)
+    || /\bcurl\b[^;&|]*(?:\s-o\s|--output(?:=|\s))/.test(command)
+    || /\bwget\b[^;&|]*(?:\s-O\s|--output-document(?:=|\s))/.test(command)
+    || /(?:^|[\s/])(?:deploy|release|publish)(?:[-_.][a-z0-9_-]+)?\.sh(?:$|[\s;&|])/.test(command);
+}
+function remoteTerminalSourceWriteDenied(instance: OdooInstance, commandLine: string, workingDirectory: string): boolean {
+  const command = commandLine.toLowerCase();
+  const mutation = /(?:\b(?:tee|sed\s+-i|perl\s+-i|cp|mv|rm|touch|truncate|install|dd|vim|vi|nano|emacs)\b|(?:>|>>|1>|2>|\|\s*tee)\s*|\b(?:python|python3|node|ruby|perl|php)\s+-(?:c|e)\b|\b(?:tar\s+[^;&|]*--?x|unzip\s|7z\s+x\b))/i.test(command);
+  if (!mutation) return false;
+  if (remoteSourceWriteDenied(instance, workingDirectory, undefined)) return true;
+  const absolutePaths = commandLine.match(/\/(?:[A-Za-z0-9_.@+-]+\/)*[A-Za-z0-9_.@+-]+/g) ?? [];
+  return absolutePaths.some((candidate) => remoteSourceWriteDenied(instance, candidate, undefined));
 }
 async function runLocalWorkspaceCommand(root: string, command: string, args: string[], timeoutMs: number): Promise<OperationResult<TerminalExecution>> {
   return new Promise((resolve) => {
     const startedAt = Date.now(); let stdout = ''; let stderr = ''; let timedOut = false; let truncated = false;
-    const child = spawn(command, args, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+    const child = spawn(command, args, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], shell: false, detached: process.platform !== 'win32', env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root, TMPDIR: app.getPath('temp'), LANG: process.env.LANG ?? 'C.UTF-8', LC_ALL: process.env.LC_ALL ?? 'C.UTF-8', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0' } });
     const append = (current: string, chunk: Buffer, max: number): string => { const value = chunk.toString(); if (current.length >= max) { truncated = true; return current; } if (current.length + value.length > max) { truncated = true; return current + value.slice(0, max - current.length); } return current + value; };
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
+    const timer = setTimeout(() => { timedOut = true; if (process.platform !== 'win32' && child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); } } else child.kill('SIGKILL'); }, timeoutMs);
     child.stdout?.on('data', (chunk: Buffer) => { stdout = append(stdout, chunk, 64 * 1024); }); child.stderr?.on('data', (chunk: Buffer) => { stderr = append(stderr, chunk, 16 * 1024); });
     child.once('error', () => { clearTimeout(timer); resolve(fail('workspace_command_failed', 'Could not start the approved local development command.')); });
     child.once('close', (code) => { clearTimeout(timer); resolve(ok({ stdout: redacted(stdout), stderr: redacted(stderr), exitCode: code, timedOut, truncated, durationMs: Date.now() - startedAt })); });
@@ -805,26 +875,29 @@ async function executeWorkspace(instance: OdooInstance, operation: string, input
     const executable = 'odoo_exec=$(command -v odoo || command -v odoo-bin || true); test -n "$odoo_exec" || { echo "Odoo executable not found" >&2; exit 127; }; ';
     const run = await runOdoo(instance, odoo.data, `${executable} code=$(printf %s "$1" | base64 -d); printf '%s\\n' "$code" | "$odoo_exec" shell -d "$2" --no-http`, [Buffer.from(code).toString('base64'), instance.database.name], 60_000);
     if (!run.ok || run.data.exitCode !== 0 || !/^installed\s*$/m.test(run.data.stdout)) { const verification = run.ok ? `Module ${module} did not verify as installed: ${redacted(run.data.stdout || run.data.stderr).slice(0, 500)}` : 'Remote verification could not run.'; instance.developmentWorkspace.deployment.verification = verification; instance.developmentWorkspace.deployment.updatedAt = new Date().toISOString(); saveStore(); audit('workspace', operation, 'failure', verification, { instanceId: instance.id }); return fail('deployment_verification_failed', verification); }
-    instance.developmentWorkspace.deployment.state = 'deployment_verified'; instance.developmentWorkspace.deployment.verification = `Module ${module} is installed after user-reported deployment.`; instance.developmentWorkspace.deployment.updatedAt = new Date().toISOString(); saveStore(); audit('workspace', operation, 'success', instance.developmentWorkspace.deployment.verification, { instanceId: instance.id }); return ok({ state: 'deployment_verified', module, output: run.data.stdout });
+    instance.developmentWorkspace.deployment.state = 'deployment_verified'; instance.developmentWorkspace.deployment.verification = `Module ${module} is installed in the configured database after user-reported deployment. This is a deployment sanity check, not an exact comparison against the local Git revision.`; instance.developmentWorkspace.deployment.updatedAt = new Date().toISOString(); saveStore(); audit('workspace', operation, 'success', instance.developmentWorkspace.deployment.verification, { instanceId: instance.id }); return ok({ state: 'deployment_verified', module, verificationScope: 'module_installed_in_configured_database', output: run.data.stdout });
   }
   if (operation === 'workspace_execute') {
     const command = typeof input.command === 'string' ? input.command : ''; const args = Array.isArray(input.args) && input.args.length <= 40 && input.args.every((v) => typeof v === 'string' && v.length <= 500 && !/[\0\r\n]/.test(v)) ? input.args as string[] : null;
-    const allowed = new Set(['python', 'python3', 'pytest', 'node', 'npm', 'pnpm', 'yarn', 'odoo', 'odoo-bin', 'git']);
-    if (!allowed.has(command) || !args || /(^|[-_])(?:deploy|release|publish|push|pull)(?:$|[-_])|^(ssh|scp|rsync|curl|wget|docker|kubectl)$/i.test(command) || (command === 'git' && !['diff', 'status', 'show', 'log'].includes(args[0] ?? ''))) return fail('workspace_command_denied', 'Only approved local development commands are allowed; Git deployment, network transfer, and deployment commands are blocked.');
+    const gitReadOnly = !!args && command === 'git' && ['diff', 'status', 'show', 'log'].includes(args[0] ?? '') && !args.some((arg) => /^(?:--output(?:=|$)|--ext-diff(?:=|$)|--textconv(?:=|$)|-c(?:=|$)|--config-env(?:=|$))/.test(arg));
+    const packageCheck = !!args && ['npm', 'pnpm', 'yarn'].includes(command) && ((args.length === 2 && args[0] === 'run' && ['typecheck', 'lint', 'test'].includes(args[1])) || (args.length === 1 && args[0] === 'test'));
+    const pytestCheck = !!args && command === 'pytest' && args.length <= 20 && args.every((arg) => !/^(?:-p|--plugin|--import-mode|--override-ini)/.test(arg));
+    if (!args || !(gitReadOnly || packageCheck || pytestCheck)) return fail('workspace_command_denied', 'Only read-only Git inspection, the repository typecheck/lint/test scripts, and bounded pytest runs are allowed. Git commits, network operations, deployment commands, and arbitrary interpreters are blocked.');
     const approval = approvedConfirmation(operation, input, instance, root, `Local development command in ${instance.name}: ${command}`); if (!approval.ok) return approval;
     const timeoutMs = input.timeoutMs === undefined ? 30_000 : Number(input.timeoutMs); if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 120000) return fail('invalid_timeout', 'Use a timeout from 1000 to 120000 ms.');
-    const run = await runLocalWorkspaceCommand(root, command, args, timeoutMs); if (!run.ok) return run; audit('workspace', operation, run.data.exitCode === 0 ? 'success' : 'failure', `Ran approved local command ${command}.`, { instanceId: instance.id, durationMs: run.data.durationMs }); return ok({ instanceId: instance.id, workspace: root, ...run.data });
+    const run = await runLocalWorkspaceCommand(root, command, command === 'git' ? ['-c', 'core.fsmonitor=false', ...args] : args, timeoutMs); if (!run.ok) return run; audit('workspace', operation, run.data.exitCode === 0 ? 'success' : 'failure', `Ran approved local command ${command}.`, { instanceId: instance.id, durationMs: run.data.durationMs }); return ok({ instanceId: instance.id, workspace: root, ...run.data });
   }
   if (operation === 'workspace_search') {
     const query = typeof input.query === 'string' && input.query.length > 0 && input.query.length <= 200 ? input.query : ''; if (!query) return fail('invalid_query', 'Provide a source search query up to 200 characters.');
-    const matches: Array<{ path: string; line: number; text: string }> = []; const walk = (dir: string, prefix: string, depth: number): void => { if (depth > 12 || matches.length >= 200) return; for (const entry of readdirSync(dir, { withFileTypes: true })) { if (['.git', 'node_modules', '__pycache__'].includes(entry.name)) continue; const full = path.join(dir, entry.name), rel = path.join(prefix, entry.name); try { if (entry.isDirectory()) walk(full, rel, depth + 1); else if (entry.isFile() && statSync(full).size <= 512 * 1024) readFileSync(full, 'utf8').split(/\r?\n/).forEach((line, index) => { if (matches.length < 200 && line.includes(query)) matches.push({ path: rel, line: index + 1, text: line.slice(0, 500) }); }); } catch { /* inaccessible entries are skipped */ } } }; walk(root, '', 0); return ok({ query, matches });
+    const matches: Array<{ path: string; line: number; text: string }> = []; let visited = 0; const skipped = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'venv', 'out', 'dist', 'coverage', '.pytest_cache', '.mypy_cache', '.tox', 'vendor']); const walk = (dir: string, prefix: string, depth: number): void => { if (depth > 12 || matches.length >= 200 || visited >= 10_000) return; for (const entry of readdirSync(dir, { withFileTypes: true })) { if (matches.length >= 200 || visited >= 10_000) break; if (skipped.has(entry.name.toLowerCase())) continue; visited++; const full = path.join(dir, entry.name), rel = path.join(prefix, entry.name); try { if (entry.isDirectory()) walk(full, rel, depth + 1); else if (entry.isFile() && !workspaceSensitivePath(rel) && statSync(full).size <= 512 * 1024) readFileSync(full, 'utf8').split(/\r?\n/).forEach((line, index) => { if (matches.length < 200 && line.includes(query)) matches.push({ path: rel, line: index + 1, text: redacted(line.slice(0, 500)) }); }); } catch { /* inaccessible entries are skipped */ } } }; walk(root, '', 0); return ok({ query, matches, filesVisited: visited, truncated: visited >= 10_000 || matches.length >= 200 });
   }
-  if (operation === 'workspace_diff') { const target = input.path === undefined ? null : workspacePath(root, input.path); if (target && !target.ok) return target; const run = await runLocalWorkspaceCommand(root, 'git', ['diff', '--no-ext-diff', '--', ...(target ? [target.data.relative] : [])], 30_000); return run.ok ? ok({ workspace: root, diff: run.data.stdout, error: run.data.stderr, truncated: run.data.truncated }) : run; }
-  const target = workspacePath(root, input.path); if (!target.ok) return target;
+  if (operation === 'workspace_diff') { const target = input.path === undefined ? null : workspacePath(root, input.path); if (target && !target.ok) return target; const run = await runLocalWorkspaceCommand(root, 'git', ['-c', 'core.fsmonitor=false', 'diff', '--no-ext-diff', '--no-textconv', '--', ...(target ? [target.data.relative] : [])], 30_000); return run.ok ? ok({ workspace: root, diff: run.data.stdout, error: run.data.stderr, truncated: run.data.truncated }) : run; }
+  const target = workspacePath(root, input.path, operation === 'workspace_list_directory'); if (!target.ok) return target;
   const action = operation === 'workspace_write_file' ? String(input.action) : operation;
-  if (['workspace_list_directory', 'workspace_file_info', 'workspace_read_file'].includes(operation)) { const existing = canonicalWorkspaceExisting(root, target.data.path); if (!existing.ok) return existing; if (operation === 'workspace_list_directory') { try { return ok({ path: target.data.relative, entries: readdirSync(existing.data, { withFileTypes: true }).slice(0, 500).map((entry) => ({ name: entry.name, type: entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : 'other' })) }); } catch { return fail('workspace_read_failed', 'Could not list the workspace directory.'); } } const info = statSync(existing.data); if (operation === 'workspace_file_info') return ok({ path: target.data.relative, kind: info.isFile() ? 'regular file' : info.isDirectory() ? 'directory' : 'other', bytes: info.size }); if (!info.isFile() || info.size > 256 * 1024) return fail('unsafe_file', 'Only regular text files up to 256 KiB can be read.'); return ok({ path: target.data.relative, content: redacted(readFileSync(existing.data, 'utf8')), bytes: info.size }); }
+  if (['workspace_list_directory', 'workspace_file_info', 'workspace_read_file'].includes(operation)) { if (operation === 'workspace_read_file' && workspaceSensitivePath(target.data.relative)) return fail('sensitive_workspace_file_denied', 'Buddy cannot read local credential or private-key files.'); const existing = canonicalWorkspaceExisting(root, target.data.path); if (!existing.ok) return existing; if (operation === 'workspace_list_directory') { try { return ok({ path: target.data.relative, entries: readdirSync(existing.data, { withFileTypes: true }).filter((entry) => entry.name.toLowerCase() !== '.git').slice(0, 500).map((entry) => ({ name: entry.name, type: entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : 'other' })) }); } catch { return fail('workspace_read_failed', 'Could not list the workspace directory.'); } } const info = statSync(existing.data); if (operation === 'workspace_file_info') return ok({ path: target.data.relative, kind: info.isFile() ? 'regular file' : info.isDirectory() ? 'directory' : 'other', bytes: info.size }); if (!info.isFile() || info.size > 256 * 1024) return fail('unsafe_file', 'Only regular text files up to 256 KiB can be read.'); return ok({ path: target.data.relative, content: redacted(readFileSync(existing.data, 'utf8')), bytes: info.size }); }
   if (!['write', 'mkdir', 'rename', 'delete'].includes(action)) return fail('invalid_operation', 'Use write, mkdir, rename, or delete.');
   const destination = action === 'rename' ? workspacePath(root, input.destinationPath) : null; if (action === 'rename' && (!destination || !destination.ok)) return destination && !destination.ok ? destination : fail('invalid_workspace_path', 'A destination path is required.'); const destinationData = destination?.ok ? destination.data : null;
+  if (workspaceSensitivePath(target.data.relative) || (destinationData && workspaceSensitivePath(destinationData.relative))) return fail('sensitive_workspace_file_denied', 'Buddy cannot modify local credential or private-key files.');
   const content = typeof input.content === 'string' ? input.content : ''; if (action === 'write' && (typeof input.content !== 'string' || Buffer.byteLength(content, 'utf8') > 256 * 1024)) return fail('invalid_content', 'Write content must be UTF-8 text no larger than 256 KiB.');
   const approval = approvedConfirmation(operation, input, instance, root, `${action} ${target.data.relative} in local Development Workspace`); if (!approval.ok) return approval;
   try { if (action === 'mkdir') { const parent = canonicalWorkspaceParent(root, target.data.path); if (!parent.ok) return parent; mkdirSync(target.data.path); } else if (action === 'delete') { const existing = canonicalWorkspaceExisting(root, target.data.path); if (!existing.ok || existing.data === root) return existing.ok ? fail('workspace_root_protected', 'The workspace root cannot be deleted.') : existing; statSync(existing.data).isDirectory() ? rmSync(existing.data, { recursive: true }) : unlinkSync(existing.data); } else if (action === 'rename') { if (!destinationData) return fail('invalid_workspace_path', 'A destination path is required.'); const source = canonicalWorkspaceExisting(root, target.data.path); const parent = canonicalWorkspaceParent(root, destinationData.path); if (!source.ok) return source; if (!parent.ok) return parent; if (existsSync(destinationData.path)) return fail('destination_exists', 'The destination workspace path already exists.'); renameSync(source.data, destinationData.path); } else { const parent = canonicalWorkspaceParent(root, target.data.path); if (!parent.ok) return parent; if (existsSync(target.data.path)) { const existing = canonicalWorkspaceExisting(root, target.data.path); if (!existing.ok) return existing; } const temp = path.join(parent.data, `.buddy-tmp-${crypto.randomUUID()}`); writeFileSync(temp, content, { encoding: 'utf8', mode: 0o600 }); renameSync(temp, target.data.path); }
@@ -951,6 +1024,17 @@ async function assertTerminalContainerSafe(instance: OdooInstance, container: st
   } catch { return fail('invalid_docker_response', 'Docker returned an unexpected mount response.'); }
 }
 async function operationalCall(operation: unknown, input: unknown): Promise<OperationResult<unknown>> {
+  if (operation === 'odoo_list_instances') {
+    return ok(settings.instances.map((instance) => ({
+      id: instance.id,
+      name: instance.name,
+      enabled: instance.enabled,
+      environment: instance.environment,
+      odooVersion: instance.odooVersion,
+      edition: instance.edition,
+      deploymentNature: instance.deploymentNature,
+    })));
+  }
   if (!isRecord(input) || !validId(input.instanceId)) return fail('invalid_request', 'A valid instanceId is required.');
   const spec: Record<string, InstancePermission> = { container_inspect: 'containerInspect', container_logs: 'containerLogs', container_list_directory: 'containerFilesystemRead', container_file_info: 'containerFilesystemRead', container_read_file: 'containerFilesystemRead', container_write_file: 'containerFilesystemWrite', container_execute: 'containerTerminal', postgres_inspect: 'postgresRead', postgres_query_readonly: 'postgresRead', postgres_execute_write: 'postgresWrite', odoo_shell_execute: 'odooShell', odoo_list_modules: 'odooShell', odoo_inspect_module: 'odooShell', odoo_run_tests: 'runTests', odoo_service_diagnostics: 'odooDiagnostics', workspace_list_directory: 'workspaceRead', workspace_file_info: 'workspaceRead', workspace_read_file: 'workspaceRead', workspace_search: 'workspaceRead', workspace_diff: 'workspaceRead', workspace_deployment_status: 'workspaceRead', workspace_verify_deployment: 'workspaceRead', workspace_write_file: 'workspaceWrite', workspace_report_deployed: 'workspaceWrite', workspace_execute: 'workspaceExecute' };
   const permission = typeof operation === 'string' ? spec[operation] : undefined;
@@ -989,7 +1073,7 @@ async function operationalCall(operation: unknown, input: unknown): Promise<Oper
     return pgResult;
   }
   if (!isDockerized(instance.deploymentNature) && ['container_list_directory', 'container_file_info', 'container_read_file', 'container_write_file'].includes(String(operation))) {
-    if (operation === 'container_write_file' && (sourceLikeRemoteChange(input.path, input.content) || sourceLikeRemoteChange(input.destinationPath, undefined))) return fail('remote_source_change_denied', 'Remote custom source-code changes are blocked. Use this instance’s configured local Development Workspace and deploy it manually.');
+    if (operation === 'container_write_file' && (remoteSourceWriteDenied(instance, input.path, input.content) || remoteSourceWriteDenied(instance, input.destinationPath, undefined))) return fail('remote_source_change_denied', 'Remote custom source-code changes are blocked. Use this instance’s configured local Development Workspace and deploy it manually.');
     const startedAt = Date.now();
     const result = await executeRemoteFilesystem(instance, String(operation), input);
     audit('operations', String(operation), result.ok ? 'success' : 'failure', result.ok ? `Completed ${String(operation)} in configured SSH filesystem roots.` : result.error.message, { instanceId: instance.id, durationMs: Date.now() - startedAt });
@@ -1022,7 +1106,7 @@ async function operationalCall(operation: unknown, input: unknown): Promise<Oper
     const target = safeContainerPath(input.path);
     const destination = action === 'rename' ? safeContainerPath(input.destinationPath) : null;
     if (!target || (action === 'rename' && !destination)) return fail('invalid_path', 'Use authorized absolute paths without traversal segments.');
-    if (sourceLikeRemoteChange(target, input.content) || sourceLikeRemoteChange(destination, undefined)) return fail('remote_source_change_denied', 'Remote custom source-code changes are blocked. Use this instance’s configured local Development Workspace and deploy it manually.');
+    if (remoteSourceWriteDenied(instance, target, input.content) || remoteSourceWriteDenied(instance, destination, undefined)) return fail('remote_source_change_denied', 'Remote custom source-code changes are blocked. Use this instance’s configured local Development Workspace and deploy it manually.');
     const content = typeof input.content === 'string' ? input.content : '';
     if (action === 'write' && (typeof input.content !== 'string' || Buffer.byteLength(content, 'utf8') > 256 * 1024)) return fail('invalid_content', 'Write content must be UTF-8 text no larger than 256 KiB.');
     const summary = `${String(action)} ${target}${destination ? ` → ${destination}` : ''} in configured Odoo container`;
@@ -1054,6 +1138,8 @@ async function operationalCall(operation: unknown, input: unknown): Promise<Oper
     const commandLine = [command, ...(rawArgs as string[]).map((item) => JSON.stringify(item))].join(' ');
     const workingDirectory = input.workingDirectory === undefined ? '' : input.workingDirectory;
     if (typeof workingDirectory !== 'string' || workingDirectory.length > 500 || /[\0\r\n]/.test(workingDirectory) || workingDirectory === '/var/run/docker.sock' || workingDirectory.startsWith('/var/run/docker.sock/')) return fail('invalid_working_directory', 'Working directory is invalid or targets the Docker socket.');
+    if (remoteDeploymentCommandDenied(commandLine)) return fail('manual_deployment_only', 'Buddy cannot deploy, pull source, upgrade modules, or restart remote services. Perform deployment manually, then tell Buddy when it is complete.');
+    if (remoteTerminalSourceWriteDenied(instance, commandLine, workingDirectory)) return fail('remote_source_change_denied', 'Remote terminal commands that appear to modify custom source code are blocked. Make source changes in this instance’s local Development Workspace and deploy manually.');
     const environment = terminalEnvironment(input.environment);
     if (!environment.ok) return environment;
     if (isDockerized(instance.deploymentNature)) {
